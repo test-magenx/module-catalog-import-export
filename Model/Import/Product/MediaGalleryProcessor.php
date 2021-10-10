@@ -12,7 +12,6 @@ use Magento\CatalogImportExport\Model\Import\Proxy\Product\ResourceModelFactory;
 use Magento\Framework\App\ResourceConnection;
 use Magento\Framework\EntityManager\MetadataPool;
 use Magento\ImportExport\Model\Import\ErrorProcessing\ProcessingErrorAggregatorInterface;
-use Magento\Store\Model\Store;
 
 /**
  * Process and saves images during import.
@@ -260,10 +259,7 @@ class MediaGalleryProcessor
             $position = $data['position'];
             $storeId = $data['store_id'];
             $mediaGalleryValueData[$index]['value_id'] = $productIdMediaValueIdMap[$productId][$value];
-            $lastPosition = $lastPositions[$storeId][$productId]
-                ?? $lastPositions[Store::DEFAULT_STORE_ID][$productId]
-                ?? 0;
-            $mediaGalleryValueData[$index]['position'] = $position + $lastPosition;
+            $mediaGalleryValueData[$index]['position'] = $position + ($lastPositions[$storeId][$productId] ?? 0);
             unset($mediaGalleryValueData[$index]['value']);
         }
         return $mediaGalleryValueData;
