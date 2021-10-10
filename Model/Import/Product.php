@@ -23,7 +23,6 @@ use Magento\Framework\Exception\LocalizedException;
 use Magento\Framework\Exception\NoSuchEntityException;
 use Magento\Framework\Filesystem;
 use Magento\Framework\Filesystem\Driver\File;
-use Magento\Framework\Filesystem\DriverPool;
 use Magento\Framework\Intl\DateTimeFactory;
 use Magento\Framework\Model\ResourceModel\Db\ObjectRelationProcessor;
 use Magento\Framework\Model\ResourceModel\Db\TransactionManagerInterface;
@@ -769,6 +768,11 @@ class Product extends AbstractEntity
     private $linkProcessor;
 
     /**
+     * @var File
+     */
+    private $fileDriver;
+
+    /**
      * @param \Magento\Framework\Json\Helper\Data $jsonHelper
      * @param \Magento\ImportExport\Helper\Data $importExportData
      * @param \Magento\ImportExport\Model\ResourceModel\Import\Data $importData
@@ -821,7 +825,6 @@ class Product extends AbstractEntity
      * @throws \Magento\Framework\Exception\FileSystemException
      * @SuppressWarnings(PHPMD.ExcessiveParameterList)
      * @SuppressWarnings(PHPMD.ExcessiveMethodLength)
-     * @SuppressWarnings(PHPMD.UnusedFormalParameter)
      */
     public function __construct(
         \Magento\Framework\Json\Helper\Data $jsonHelper,
@@ -935,6 +938,7 @@ class Product extends AbstractEntity
         $this->dateTimeFactory = $dateTimeFactory ?? ObjectManager::getInstance()->get(DateTimeFactory::class);
         $this->productRepository = $productRepository ?? ObjectManager::getInstance()
                 ->get(ProductRepositoryInterface::class);
+        $this->fileDriver = $fileDriver ?: ObjectManager::getInstance()->get(File::class);
     }
 
     /**
@@ -1346,40 +1350,6 @@ class Product extends AbstractEntity
     }
 
     /**
-     * Get data for updating product-category relations
-     *
-     * @param array $categoriesData
-     * @param string $tableName
-     * @return array
-     */
-    private function getProductCategoriesDataSave(array $categoriesData, string $tableName): array
-    {
-        $delProductId = [];
-        $categoriesIn = [];
-        $minCategoryPosition = [];
-        foreach ($categoriesData as $delSku => $categories) {
-            $productId = $this->skuProcessor->getNewSku($delSku)['entity_id'];
-            $delProductId[] = $productId;
-
-            foreach (array_keys($categories) as $categoryId) {
-                //position new products before existing ones
-                if (!isset($minCategoryPosition[$categoryId])) {
-                    $select = $this->_connection->select()
-                        ->from($tableName, ['position' => new \Zend_Db_Expr('MIN(position)')])
-                        ->where('category_id = ?', $categoryId);
-                    $minCategoryPosition[$categoryId] = (int)$this->_connection->fetchOne($select);
-                }
-                $categoriesIn[] = [
-                    'product_id' => $productId,
-                    'category_id' => $categoryId,
-                    'position' => --$minCategoryPosition[$categoryId]
-                ];
-            }
-        }
-        return [$delProductId, $categoriesIn];
-    }
-
-    /**
      * Save product categories.
      *
      * @param array $categoriesData
@@ -1393,8 +1363,17 @@ class Product extends AbstractEntity
             $tableName = $this->_resourceFactory->create()->getProductCategoryTable();
         }
         if ($categoriesData) {
-            list($delProductId, $categoriesIn) = $this->getProductCategoriesDataSave($categoriesData, $tableName);
+            $categoriesIn = [];
+            $delProductId = [];
 
+            foreach ($categoriesData as $delSku => $categories) {
+                $productId = $this->skuProcessor->getNewSku($delSku)['entity_id'];
+                $delProductId[] = $productId;
+
+                foreach (array_keys($categories) as $categoryId) {
+                    $categoriesIn[] = ['product_id' => $productId, 'category_id' => $categoryId, 'position' => 0];
+                }
+            }
             if (Import::BEHAVIOR_APPEND != $this->getBehavior()) {
                 $this->_connection->delete(
                     $tableName,
@@ -1601,6 +1580,7 @@ class Product extends AbstractEntity
             $previousType = null;
             $prevAttributeSet = null;
 
+            $importDir = $this->_mediaDirectory->getAbsolutePath($this->getUploader()->getTmpDir());
             $existingImages = $this->getExistingImages($bunch);
             $this->addImageHashes($existingImages);
 
@@ -1770,10 +1750,7 @@ class Product extends AbstractEntity
                 $position = 0;
                 foreach ($rowImages as $column => $columnImages) {
                     foreach ($columnImages as $columnImageKey => $columnImage) {
-                        $hash = filter_var($columnImage, FILTER_VALIDATE_URL)
-                            ? $this->getRemoteFileHash($columnImage)
-                            : $this->getFileHash($this->joinFilePaths($this->getUploader()->getTmpDir(), $columnImage));
-                        $uploadedFile = $this->findImageByHash($rowExistingImages, $hash);
+                        $uploadedFile = $this->getAlreadyExistedImage($rowExistingImages, $columnImage, $importDir);
                         if (!$uploadedFile && !isset($uploadedImages[$columnImage])) {
                             $uploadedFile = $this->uploadMediaFiles($columnImage);
                             $uploadedFile = $uploadedFile ?: $this->getSystemFile($columnImage);
@@ -1978,29 +1955,40 @@ class Product extends AbstractEntity
      *
      * @param string $path
      * @return string
-     * @throws \Magento\Framework\Exception\FileSystemException
      */
     private function getFileHash(string $path): string
     {
-        $content = '';
-        if ($this->_mediaDirectory->isFile($path)
-            && $this->_mediaDirectory->isReadable($path)
-        ) {
-            $content = $this->_mediaDirectory->readFile($path);
-        }
-        return $content ? hash(self::HASH_ALGORITHM, $content) : '';
+        return hash_file(self::HASH_ALGORITHM, $path);
     }
 
     /**
-     * Returns hash for remote file
+     * Returns existed image
      *
-     * @param string $filename
+     * @param array $imageRow
+     * @param string $columnImage
+     * @param string $importDir
      * @return string
      */
-    private function getRemoteFileHash(string $filename): string
+    private function getAlreadyExistedImage(array $imageRow, string $columnImage, string $importDir): string
     {
-        $hash = hash_file(self::HASH_ALGORITHM, $filename);
-        return $hash !== false ? $hash : '';
+        if (filter_var($columnImage, FILTER_VALIDATE_URL)) {
+            $hash = $this->getFileHash($columnImage);
+        } else {
+            $path = $importDir . DIRECTORY_SEPARATOR . $columnImage;
+            $hash = $this->isFileExists($path) ? $this->getFileHash($path) : '';
+        }
+
+        return array_reduce(
+            $imageRow,
+            function ($exists, $file) use ($hash) {
+                if (!$exists && isset($file['hash']) && $file['hash'] === $hash) {
+                    return $file['value'];
+                }
+
+                return $exists;
+            },
+            ''
+        );
     }
 
     /**
@@ -2011,17 +1999,36 @@ class Product extends AbstractEntity
      */
     private function addImageHashes(array &$images): void
     {
-        $productMediaPath = $this->getProductMediaPath();
+        $productMediaPath = $this->filesystem->getDirectoryRead(DirectoryList::MEDIA)
+            ->getAbsolutePath(DIRECTORY_SEPARATOR . 'catalog' . DIRECTORY_SEPARATOR . 'product');
+
         foreach ($images as $storeId => $skus) {
             foreach ($skus as $sku => $files) {
                 foreach ($files as $path => $file) {
-                    $hash = $this->getFileHash($this->joinFilePaths($productMediaPath, $file['value']));
-                    if ($hash) {
-                        $images[$storeId][$sku][$path]['hash'] = $hash;
+                    if ($this->fileDriver->isExists($productMediaPath . $file['value'])) {
+                        $fileName = $productMediaPath . $file['value'];
+                        $images[$storeId][$sku][$path]['hash'] = $this->getFileHash($fileName);
                     }
                 }
             }
         }
+    }
+
+    /**
+     * Is file exists
+     *
+     * @param string $path
+     * @return bool
+     */
+    private function isFileExists(string $path): bool
+    {
+        try {
+            $fileExists = $this->fileDriver->isExists($path);
+        } catch (\Exception $exception) {
+            $fileExists = false;
+        }
+
+        return $fileExists;
     }
 
     /**
@@ -2207,6 +2214,14 @@ class Product extends AbstractEntity
 
             $fileUploader->init();
 
+            $dirConfig = DirectoryList::getDefaultConfig();
+            $dirAddon = $dirConfig[DirectoryList::MEDIA][DirectoryList::PATH];
+
+            // make media folder a primary folder for media in external storages
+            if (!is_a($this->_mediaDirectory->getDriver(), File::class)) {
+                $dirAddon = DirectoryList::MEDIA;
+            }
+
             $tmpPath = $this->getImportDir();
 
             if (!$fileUploader->setTmpDir($tmpPath)) {
@@ -2214,8 +2229,8 @@ class Product extends AbstractEntity
                     __('File directory \'%1\' is not readable.', $tmpPath)
                 );
             }
-
-            $destinationPath = $this->getProductMediaPath();
+            $destinationDir = "catalog/product";
+            $destinationPath = $dirAddon . '/' . $this->_mediaDirectory->getRelativePath($destinationDir);
 
             $this->_mediaDirectory->create($destinationPath);
             if (!$fileUploader->setDestDir($destinationPath)) {
@@ -2269,11 +2284,11 @@ class Product extends AbstractEntity
      */
     private function getSystemFile($fileName)
     {
-        $filePath = $this->joinFilePaths($this->getProductMediaPath(), $fileName);
+        $filePath = 'catalog' . DIRECTORY_SEPARATOR . 'product' . DIRECTORY_SEPARATOR . $fileName;
+        /** @var \Magento\Framework\Filesystem\Directory\ReadInterface $read */
+        $read = $this->filesystem->getDirectoryRead(DirectoryList::MEDIA);
 
-        return $this->_mediaDirectory->isFile($filePath) && $this->_mediaDirectory->isReadable($filePath)
-            ? $fileName
-            : '';
+        return $read->isExist($filePath) && $read->isReadable($filePath) ? $fileName : '';
     }
 
     /**
@@ -3004,7 +3019,7 @@ class Product extends AbstractEntity
     {
         if (!empty($rowData[self::URL_KEY])) {
             $urlKey = (string) $rowData[self::URL_KEY];
-            return $this->productUrl->formatUrlKey($urlKey);
+            return trim(strtolower($urlKey));
         }
 
         if (!empty($rowData[self::COL_NAME])
@@ -3264,69 +3279,5 @@ class Product extends AbstractEntity
         $productId = $this->skuProcessor->getNewSku($rowData[self::COL_SKU])['entity_id'];
         $websiteId = $this->stockConfiguration->getDefaultScopeId();
         return $this->stockRegistry->getStockItem($productId, $websiteId);
-    }
-
-    /**
-     * Returns image that matches the provided hash
-     *
-     * @param array $images
-     * @param string $hash
-     * @return string
-     */
-    private function findImageByHash(array $images, string $hash): string
-    {
-        $value = '';
-        if ($hash) {
-            foreach ($images as $image) {
-                if (isset($image['hash']) && $image['hash'] === $hash) {
-                    $value = $image['value'];
-                    break;
-                }
-            }
-        }
-        return $value;
-    }
-
-    /**
-     * Returns product media
-     *
-     * @return string relative path to root folder
-     */
-    private function getProductMediaPath(): string
-    {
-        return $this->joinFilePaths($this->getMediaBasePath(), 'catalog', 'product');
-    }
-
-    /**
-     * Returns media base path
-     *
-     * @return string relative path to root folder
-     */
-    private function getMediaBasePath(): string
-    {
-        $mediaDir = !is_a($this->_mediaDirectory->getDriver(), File::class)
-            // make media folder a primary folder for media in external storages
-            ? $this->filesystem->getDirectoryReadByPath(DirectoryList::MEDIA)
-            : $this->filesystem->getDirectoryRead(DirectoryList::MEDIA);
-
-        return $this->_mediaDirectory->getRelativePath($mediaDir->getAbsolutePath());
-    }
-
-    /**
-     * Joins two paths and remove redundant directory separator
-     *
-     * @param array $paths
-     * @return string
-     */
-    private function joinFilePaths(...$paths): string
-    {
-        $result = '';
-        if ($paths) {
-            $result = rtrim(array_shift($paths), DIRECTORY_SEPARATOR);
-            foreach ($paths as $path) {
-                $result .= DIRECTORY_SEPARATOR . ltrim($path, DIRECTORY_SEPARATOR);
-            }
-        }
-        return $result;
     }
 }

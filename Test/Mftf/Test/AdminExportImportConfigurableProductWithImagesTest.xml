@@ -171,14 +171,11 @@
         </actionGroup>
         <reloadPage stepKey="refreshPage"/>
         <waitForElementVisible selector="{{AdminExportAttributeSection.exportFileNameByPosition('0')}}" stepKey="waitForFileName"/>
-        <grabTextFrom selector="{{AdminExportAttributeSection.exportFileNameByPosition('0')}}" stepKey="getFilename"/>
-        <actionGroup ref="AdminGetExportFilenameOnServerActionGroup" stepKey="grabNameFile">
-            <argument name="rowIndex" value="0"/>
-        </actionGroup>
+        <grabTextFrom selector="{{AdminExportAttributeSection.exportFileNameByPosition('0')}}" stepKey="grabNameFile"/>
 
         <!-- Save exported file: file successfully downloaded -->
         <actionGroup ref="DownloadFileActionGroup" stepKey="downloadCreatedProducts">
-            <argument name="fileName" value="{$getFilename}"/>
+            <argument name="fileName" value="{$grabNameFile}"/>
         </actionGroup>
 
         <!-- Go to Catalog > Products. Find ConfProd and delete it -->
@@ -225,7 +222,7 @@
 
         <!-- Delete exported file -->
         <actionGroup ref="DeleteExportedFileActionGroup" stepKey="deleteExportedFile">
-            <argument name="fileName" value="{$getFilename}"/>
+            <argument name="fileName" value="{$grabNameFile}"/>
         </actionGroup>
     </test>
 </tests>
